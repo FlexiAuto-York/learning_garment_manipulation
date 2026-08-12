@@ -1,0 +1,43 @@
+id: EXP001
+name: MAGPIE canonicalisation-alignment from crumpled states
+description: >-
+  Multi-primitive flow-matching policy trained on human demonstrations across all simulated
+  garment types, evaluated on canonicalisation-alignment from crumpled initial states.
+
+release: v0.1.0
+commit: TODO            # fill in at run time: git rev-parse HEAD
+
+config:
+  experiment: sim_exp/magpie/magpie_ctr_align_all_sim_garments_p4_v126_hindsight
+  agent: agent/magpie/magpie_ctr_align_all_sim_garments_p4_v126_hindsight
+  arena: arena/magpie/multi_longsleeve_provide_semkey_pixel_no_success_stop_resol_128_workspace
+  task: task/magpie/central_alignment
+
+platform:
+  simulator: SoftGym / PyFlex
+  robot: dual simulated pickers
+  gpu_memory_required: ~24 GB
+
+inputs:
+  dataset: all_garments_multi_primitive_alignment
+  dataset_location: ./data/datasets/
+  assets: assets.zip          # meshes, cached goals, semantic keypoints
+
+outputs:
+  location: ${GARMENT_DATA_ROOT}/bimanual_garment_folding/magpie_ctr_align_all_sim_garments_p4_v126_hindsight/
+  artefacts:
+    - checkpoints
+    - evaluation metrics (CSV)
+    - episode videos
+
+metrics:
+  - normalised_coverage
+  - max_IoU
+  - success_rate
+
+run: ./run.sh
+
+known_limitations:
+  - Dataset is not yet publicly hosted.
+  - Alignment only; folding is a separate chained task.
+  - Simulation only.

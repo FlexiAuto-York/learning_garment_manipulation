@@ -1,0 +1,98 @@
+name: magpie
+device: 'cuda'
+
+# --- Recover the LaGarNet diffusion policy via Magpie's DDPM mode (config-only) ---
+# Magpie is the evolved diffusion agent: loss_type 'diffusion' runs classic DDPM over
+# num_diffusion_iters steps with a ConditionalUnet1D backbone; primitive_integration
+# 'none' makes it a single-primitive policy emitting the raw 4-D pick-and-place action.
+loss_type: diffusion
+noise_pred_net: unet
+action_shape: [4]
+vision_encoder: 'original'        # ResNet18 + GroupNorm -> 512-D (DRAPER vision lineage)
+# Diffusion-policy training hyperparameters (the external diffusion_policy agent carried
+# these as defaults; set explicitly for Magpie). Not from the LaGarNet paper's exact run.
+optimiser_class: 'adamw'
+optimiser_params: { lr: 1.0e-4, weight_decay: 1.0e-6 }
+num_warmup_steps: 500
+ema_power: 0.75
+grad_clip_norm: 1.0
+val_interval: 1000
+validate_training: True
+feature_noise_factor: 0.0
+predict_goal_state: False
+mask_out_irrelavent_action_dim: False
+
+oracle: False # TODO: fix this, I need to add this because of build_agent function
+obs_dim: 512
+action_dim: 4
+obs_horizon: 1
+pred_horizon: 1
+num_diffusion_iters: 100
+action_horizon: 1
+input_obs: 'rgb'
+use_mask: True
+eval_action_sampler: 'normal'
+include_state: False
+num_demos: 200
+batch_size: 64
+disable_updown: True
+# action_shape: [8]
+collect_on_success: False # This is important!
+data_obs: 'image'
+data_state: 'agent_pos'
+data_action: 'action'
+train_mode: 'from_policy'
+demo_policy: "human-single-picker-pick-and-place"
+validation_interval: 1000
+total_update_steps: 50000
+eval_checkpoint: -1
+debug: False
+add_all_demos: True
+
+dataset_mode: "general"
+dataset_config:
+  data_path: "multi_trousers_single_picker_single_primitive_flattening_human"
+  data_dir: "./data/datasets"
+  seq_length: 1
+  io_mode: "w"
+  cache_in_memory: True
+  obs_config:
+    mask: 
+      shape: [128, 128, 1]
+      output_key: 'mask'
+    
+    depth: 
+      shape: [128, 128, 1]
+      output_key: 'depth'
+    
+    rgb: 
+      shape: [128, 128, 3]
+      output_key: 'rgb'
+
+    goal_rgb: 
+      shape: [128, 128, 3]
+      output_key: 'goal_rgb'
+    
+    goal_depth: 
+      shape: [128, 128, 1]
+      output_key: 'goal_depth'
+    
+    goal_mask: 
+      shape: [128, 128, 1]
+      output_key: 'goal_mask'
+  
+  act_config:
+    default: 
+      shape: [4]
+      output_key: 'default'
+
+primitive_integration: 'none'
+
+data_augmenter: pixel_based_multi_primitive_augmenter_for_diffusion_K_0
+# primitives:
+#   - name: norm-pixel-fold
+#     dim: 8 #params: [pick_0, pick_1, place_0, place_1]
+# mask_out_irrelavent_action_dim: true
+
+# exp_name: ${exp_name}
+# project_name: ${project_name}

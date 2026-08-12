@@ -1,0 +1,1659 @@
+# extend upon https://github.com/Xingyu-Lin/softagent/blob/master/planet/models.py
+import os
+import numpy as np
+import cv2
+from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader
+from torch import nn
+from torch.nn import functional as F
+import torch.distributions as td
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
+from torch.distributions.kl import kl_divergence
+from torch.distributions import Normal
+from omegaconf import OmegaConf
+from dotmap import DotMap
+import time
+
+from actoris_harena.torch_utils import *
+from actoris_harena.registration.dataset import *
+from actoris_harena.agent.oracle.builder import OracleBuilder
+from actoris_harena import RLAgent
+from diffusers.optimization import get_scheduler
+from data_augmentation.register_augmeters import build_data_augmenter
+
+from .networks import ImageEncoder, ImageDecoder
+from .memory import ExperienceReplay
+# from .logger import *
+from .cost_functions import *
+from .model import *
+from .reward import REWARD
+
+def reward_bonus_and_penalty(rewards, observations, actions):
+    if isinstance(rewards, torch.Tensor):
+        rewards_ = rewards.clone()
+    else:
+        rewards_ = rewards.copy()
+
+    above_0_9 = observations['normalised_coverage'][:, :-1] > 0.9
+    below_0_9 = observations['normalised_coverage'][:, 1:] < 0.9
+    first_state_no_term = observations['terminal'][:, :-1] == 0
+
+    rewards_[:, 1:][above_0_9 & below_0_9 & first_state_no_term] = 0
+
+    above_0_9_5 = observations['normalised_coverage'][:] > 0.95
+    rewards_[above_0_9_5] = 0.7
+
+
+    return rewards
+
+class RSSM(RLAgent):
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.input_obs = self.config.input_obs
+        self.debug = self.config.debug
+        
+        self.no_op = np.asarray(config.no_op).flatten()
+        self.model = dict()
+        self.init_transition_model()
+        self.reward_processor = lambda r, s, a: r
+        
+
+        self.model['observation_model'] = ImageDecoder(
+            image_dim=config.output_obs_dim,
+            belief_size=config.deterministic_latent_dim,
+            state_size=config.stochastic_latent_dim,
+            embedding_size=config.embedding_dim,
+            activation_function=config.activation,
+            batchnorm=config.decoder_batchnorm
+        ).to(config.device)
+
+        self.model['reward_model'] = RewardModel(
+            belief_size=self.config.deterministic_latent_dim,
+            state_size=self.config.stochastic_latent_dim,
+            hidden_size=self.config.hidden_dim,
+            activation_function=self.config.activation,
+            num_layers = self.config.get('reward_layers', 3)
+        ).to(self.config.device)
+
+        if self.config.encoder_mode == 'default':
+            self.model['encoder'] = ImageEncoder(
+                image_dim=self.config.input_obs_dim,
+                embedding_size=self.config.embedding_dim,
+                activation_function=self.config.activation,
+                batchnorm=self.config.encoder_batchnorm,
+                residual=self.config.encoder_residual
+            ).to(config.device)
+        else:
+            raise NotImplementedError
+
+        params = [list(m.parameters()) for m in self.model.values()]
+        self.param_list = []
+        for p in params:
+            self.param_list.extend(p)
+        
+        # Count the number of all parameters in the model
+        num_parameters = 0
+        for k, v in self.model.items():
+            n = sum(p.numel() for p in v.parameters())
+            print(f"Number of parameters in {k}: {n}")
+
+            num_parameters += n
+
+        print(f"Number of all parameters in the model: {num_parameters}")
+
+
+        # 1. Convert Hydra config to a standard dict
+        optimiser_params = OmegaConf.to_container(
+            self.config.optimiser_params,
+            resolve=True
+        )
+
+        # 2. Use the builder function instead of the dictionary
+        # Note: We pass the params list and unpack the rest of the kwargs
+        self.optimiser = build_optimizer(
+            name=self.config.optimiser_class,
+            params=self.param_list,
+            **optimiser_params
+        )
+
+        # optimiser_params["params"] = self.param_list
+
+        # self.optimiser = OPTIMISER_CLASSES[self.config.optimiser_class](**optimiser_params)
+        
+        scheduler_name = self.config.get('lr_scheduler', 'constant')
+        warmup_steps = self.config.get('num_warmup_steps', 0)
+        
+        if scheduler_name and scheduler_name.lower() != 'none':
+            self.lr_scheduler = get_scheduler(
+                name=scheduler_name,
+                optimizer=self.optimiser,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=self.config.total_update_steps
+            )
+        else:
+            self.lr_scheduler = None
+
+        self.loaded = False
+        self.symlog = self.config.symlog
+
+        #Dot map to dict
+        #transform_config = self.config.data_agumenter
+        #self.transform = DATA_TRANSFORMER[transform_config.name](transform_config.params)
+        self.data_augmenter = build_data_augmenter(config.data_augmenter)
+
+        
+        self.apply_transform_in_dataset = self.config.get('apply_transform_in_dataset', False)
+
+        planning_config = OmegaConf.to_container(
+            self.config.policy.params,
+            resolve=True
+        )
+
+        #planning_config = self.config.policy.params
+        planning_config["model"] = self
+        #planning_config["action_space"] = self.config.action_space
+        planning_config["no_op"] = self.no_op
+        planning_config = DotMap(planning_config)
+                
+        import actoris_harena.api as ag_ar
+        self.planning_algo = ag_ar.build_agent(
+            self.config.policy.name,
+            config=planning_config,
+            disable_wandb=True)
+        
+        self.data_sampler = self.config.get('data_sampler', 'uniform')
+        self.internal_states = {}
+        #self.logger = Logger()
+        self.cur_state = {}
+        
+        self.datasets = None
+
+        self.apply_reward_processor = self.config.get('apply_reward_processor', False)
+        self.reward_processor = REWARD[self.config.get('reward_processor', 'identity')]
+
+    def init_transition_model(self):
+        self.model['transition_model'] = TransitionModel(
+            belief_size=self.config.deterministic_latent_dim,
+            state_size=self.config.stochastic_latent_dim,
+            action_size = np.prod(np.array(self.config.action_dim)), 
+            hidden_size=self.config.hidden_dim,
+            embedding_size=self.config.embedding_dim,
+            activation_function=self.config.activation,
+            min_std_dev=self.config.min_std_dev,
+            embedding_layers=self.config.trans_layers
+        ).to(self.config.device)
+
+    def set_log_dir(self, logdir, project_name, exp_name, disable_wandb=False):
+        super().set_log_dir(logdir, project_name, exp_name, disable_wandb=disable_wandb)
+        self.save_dir = logdir
+        # self.logger = TrainWriter(self.save_dir)
+    
+        
+    def reset(self, areana_ids):
+        for arena_id in areana_ids:
+            self.cur_state[arena_id] = {}
+            self.internal_states[arena_id] = {}
+            self.internal_states[arena_id]['inference_time'] = []
+
+    def get_state(self):
+        return self.internal_states
+    
+    def single_act(self, info, update=False):
+        start_time = time.time()
+        action =  self.planning_algo.act([info], updates=[False])[0].flatten()
+        plan_internal_state = self.planning_algo.get_state()[info['arena_id']]
+        #print('plan internal state', plan_internal_state)
+        for k, v in plan_internal_state.items():
+            self.internal_states[info['arena_id']][k] = v
+        duration = time.time() - start_time
+        self.internal_states[info['arena_id']]['inference_time'].append(duration)
+        
+        #print(f"Arena {info.get('arena_id', 'Unknown')}: Action planned in {duration:.4f} seconds.")
+        return action
+
+    def act(self, infos, update=False):
+        actions = []
+        for info in infos:
+            
+            ret_action = self.single_act(info)
+            actions.append(ret_action)
+       
+        return actions
+
+    def get_name(self):
+        return "RSSM PlaNet"
+    
+    
+    def train(self, update_steps, arenas) -> bool:
+        torch.backends.cudnn.benchmark = True
+     
+        if self.config.train_mode == 'offline':
+            if self.datasets == None:
+                datasets = {}
+                if 'datasets' in self.config:
+                    if 'initialised_datasets' in self.config and self.config.initialised_datasets:
+                        datasets = self.config.datasets
+                    else:
+                        for dataset_dict in self.config['datasets']:
+                            key = dataset_dict['key']
+                            print()
+                            print('Initialising dataset {} from name {}'.format(key, dataset_dict['name']))
+
+                            dataset_params = dataset_dict['params']
+                            
+                            
+                            dataset = name_to_dataset[dataset_dict['name']](
+                                **dataset_params)
+
+                            datasets[key] = dataset
+                else:
+                    raise NotImplementedError
+
+                for key, dataset in datasets.items():
+                    if self.apply_transform_in_dataset:
+                        dataset.set_transform(self.data_augmenter)
+                self.datasets = datasets
+                
+            self._train_offline(self.datasets, update_steps)
+
+        elif self.config.train_mode == 'online':
+            
+            # planning_config = OmegaConf.to_container(
+            #     self.config.explore_policy.params,
+            #     resolve=True
+            # )
+
+            # #planning_config = self.config.policy.params
+            # planning_config["model"] = self
+            # #planning_config["action_space"] = self.config.action_space
+            # planning_config["no_op"] = self.no_op
+            # planning_config = DotMap(planning_config)
+
+            # import actoris_harena.api as ag_ar
+            # self.explore_policy = ag_ar.build_agent(
+            #     self.config.explore_policy.name,
+            #     config=planning_config,
+            #     disable_wandb=True)
+            
+
+            self.train_online(arenas[0], self, update_steps)
+        else: 
+            raise NotImplementedError
+    
+        return True
+    
+    def reconstruct_observation(self, state):
+
+        return ts_to_np(bottle(
+            self.model['observation_model'], 
+            (state['deter'], state['stoch']['sample'])))
+    
+    def _update_helper(self, info, action, reset_internal=False):
+        arena_id = info['arena_id']
+        obs = info['observation']
+        mask = obs['mask']
+        self.no_op = self.no_op.flatten()
+
+        
+        if self.config.input_obs == 'gc-depth':
+            obs_ = np.concatenate([obs['depth'], obs['goal_depth']], axis=-1)
+            goal_mask = obs['goal_mask']
+        elif self.config.input_obs == 'rgb+goal-rgb':
+            obs_ = np.concatenate([obs['rgb'], obs['goal-rgb']], axis=-1)
+            goal_mask = obs['goal-mask']
+        elif self.config.input_obs == 'rgb+goal-rgbd':
+            obs_ = np.concatenate([obs['rgb'], obs['depth'], obs['goal_rgb'], obs['goal_depth']], axis=-1)
+            goal_mask = obs['goal_mask']
+        elif self.config.input_obs == 'rgbd':
+            obs_ = np.concatenate([obs['rgb'], obs['depth']], axis=-1)
+        else:
+            obs_ = info['observation'][self.config.input_obs]
+
+        if len(mask.shape) == 2:
+            mask = np.expand_dims(mask, axis=0)
+
+        
+        to_trans_dict = {
+            self.config.input_obs: np.expand_dims(obs_, axis=(0)),
+            'mask': np.expand_dims(mask, axis=(0)),
+        }
+        if self.config.input_obs in ['gc-depth', 'rgb+goal-rgb', 'rgb+goal-rgbd']:
+            if len(goal_mask.shape) == 2:
+                goal_mask = np.expand_dims(goal_mask, axis=0)
+            to_trans_dict['goal-mask'] = np.expand_dims(goal_mask, axis=(0))
+            
+
+        image = self.data_augmenter(
+            to_trans_dict, 
+            train=False)[self.config.input_obs].to(self.config.device)
+       
+        
+        image = symlog(image, self.symlog)
+        if len(image.shape) == 4:
+            image = image.unsqueeze(0)
+
+        
+        if reset_internal:
+            self.cur_state[arena_id] = {
+                'deter': torch.zeros(
+                    1, self.config.deterministic_latent_dim, 
+                    device=self.config.device),
+                'stoch': {
+                    'sample': torch.zeros(
+                        1, self.config.stochastic_latent_dim, 
+                        device=self.config.device)
+                },
+                'input_obs': image # batch*horizon*C*H*W
+            }
+        else:
+            self.cur_state[arena_id]['input_obs'] = image
+        
+    
+        action = np_to_ts(action.flatten(), self.config.device).unsqueeze(0).unsqueeze(0)
+
+        latent_state,  _ = self.unroll_state_action(self.cur_state[arena_id] , action)
+        self.cur_state[arena_id]['deter'] = latent_state['deter'][-1]
+        self.cur_state[arena_id]['stoch']['sample'] = latent_state['stoch']['sample'][-1]
+
+        ### get the last state for
+        if self.config.debug:
+            if self.config.input_obs == 'rgb+goal-rgb':
+                rgb = ts_to_np(image[0, 0, :3, :, :].clip(0, 1)).transpose(1, 2, 0)
+                goal = ts_to_np(image[0, 0, 3:, :, :].clip(0, 1)).transpose(1, 2, 0)
+                plt.imsave(f'tmp/input_obs_rgb.png', rgb) 
+                plt.imsave(f'tmp/input_obs_goal_rgb.png', goal)
+
+        self.internal_states[arena_id].update({
+            'raw_input_obs': obs_.copy(),
+            'input_obs': image.squeeze(0).squeeze(0) \
+                .cpu().detach().numpy().transpose(1, 2, 0),
+            'deter_state': self.cur_state[arena_id]['deter']\
+                .squeeze(1).cpu().detach().numpy(),
+            'stoch_state': self.cur_state[arena_id]['stoch']['sample']\
+                .squeeze(1).cpu().detach().numpy(),
+            'latent_state': self.cur_state[arena_id],
+            'input_type': self.config.input_obs,
+            'output_type': self.config.output_obs,
+            'posterior_reward': self.model['reward_model'](self.cur_state[arena_id]['deter'], self.cur_state[arena_id]['stoch']['sample'])
+                .squeeze(0).cpu().detach().item(),
+            'recon_obs': self.model['observation_model'](self.cur_state[arena_id]['deter'], self.cur_state[arena_id]['stoch']['sample']).cpu().detach()
+        })
+
+    def init(self, infos):
+        if not self.loaded:
+            self.load()
+        for info in infos:
+            self._update_helper(info,  np.asarray(self.no_op), reset_internal=True)
+    
+    def update(self, infos, actions):
+        if self.config.refresh_init_state:
+            self.init(infos)
+            return
+        for info, action in zip(infos, actions):
+            #print('action', action)
+            self._update_helper(info, action)
+             
+    # def flatten_action(self, action):
+    #     if 'norm-pixel-pick-and-place' in self.config.action_output:
+    #         action = action['norm-pixel-pick-and-place']
+    #     return np.stack([action['pick_0'], action['place_0']]).flatten()
+        
+    
+           
+    def cost_fn(self, trajectory, goal=None):
+        if self.config.cost_fn == 'trajectory_return':
+            return trajectory_return(trajectory, self)
+        elif self.config.cost_fn == 'last_step_z_divergence_goal':
+            return last_step_z_divergence_goal(trajectory, goal, self)
+        elif self.config.cost_fn == 'last_step_z_divergence_goal_reverse':
+            return last_step_z_divergence_goal(trajectory, goal, self, revserse=True)
+        elif self.config.cost_fn == 'last_step_z_distance_goal_stoch':
+            return last_step_z_distance_goal_stoch(trajectory, goal, self)
+        elif self.config.cost_fn == 'last_step_z_distance_goal_deter':
+            return last_step_z_distance_goal_deter(trajectory, goal, self)
+        elif self.config.cost_fn == 'last_step_z_distance_goal_both':
+            return last_step_z_distance_goal_both(trajectory, goal, self)
+        elif self.config.cost_fn == 'last_step_reward_with_uncertainty':
+            return last_step_reward_with_uncertainty(trajectory, self)
+        else:
+            raise NotImplementedError
+        
+    def unroll_action_from_cur_state(self, action, state_):
+
+        to_unroll = {}
+        candidates, horizons = action.shape[:2]
+        action = action.reshape(candidates, horizons, -1)
+        state= self.cur_state[state_['arena_id']]
+        # #state = self.cur_state
+        to_unroll['deter'] = state['deter']\
+                .squeeze(dim=1).expand(1, candidates, self.config.deterministic_latent_dim)\
+                .reshape(-1, self.config.deterministic_latent_dim)
+        
+        to_unroll['stoch'] = {
+            'sample': state['stoch']['sample']\
+                .squeeze(dim=1).expand(1, candidates, self.config.stochastic_latent_dim)\
+                .reshape(-1, self.config.stochastic_latent_dim)
+        }
+
+        action = np_to_ts(action, self.config.device).permute(1, 0, 2) ## horizon*candidates*actions
+
+        return self.unroll_action(to_unroll, action)
+    
+    def visual_reconstruct(self, state):
+
+        images = bottle(self.model['observation_model'], 
+                        (state['deter'], 
+                         state['stoch']['sample']))
+        
+        # images = ((ts_to_np(images).transpose(1, 0, 3, 4, 2) + 0.5)*255.0)\
+        #     .clip(0, 255).astype(np.uint8)
+
+        return ts_to_np(images).transpose(0, 1, 3, 4, 2)
+
+    def reward_pred(self):
+        return lambda a : symexp(self.model['reward_model'](a), self.symlog)
+    
+    def set_eval(self):
+        for v in self.model.values():
+            v.eval()
+
+    def set_train(self):
+        for v in self.model.values():
+            v.train()
+
+    def save(self, path=None):
+        
+        model_dict = {
+            'transition_model': self.model['transition_model'].state_dict(),
+            'observation_model': self.model['observation_model'].state_dict(),
+            'reward_model': self.model['reward_model'].state_dict(),
+            'encoder': self.model['encoder'].state_dict(),
+            'optimiser': self.optimiser.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict() if getattr(self, 'lr_scheduler', None) else None
+        }
+        
+        if path is None:
+            path = self.save_dir
+        
+        os.makedirs(os.path.join(path, 'checkpoints'), exist_ok=True)
+    
+        torch.save(
+            model_dict, 
+            os.path.join(path, 'checkpoints', f'model_{self.update_step}.pth')
+        )
+
+        # torch.save(
+        #     self.metrics,
+        #     os.path.join(path, 'checkpoints', f'metrics_{self.update_step}.pth')
+        # )
+
+        # if self.config.get('checkpoint_experience', False):
+        #     dst = os.path.join(path, 'checkpoints', 'experience.pkl')
+        #     self.memory.save(dst)
+    
+    def save_best(self):
+        model_dict = {
+            'transition_model': self.model['transition_model'].state_dict(),
+            'observation_model': self.model['observation_model'].state_dict(),
+            'reward_model': self.model['reward_model'].state_dict(),
+            'encoder': self.model['encoder'].state_dict(),
+            'optimiser': self.optimiser.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict() if getattr(self, 'lr_scheduler', None) else None
+        }
+        
+        path = self.save_dir
+        
+        os.makedirs(os.path.join(path, 'checkpoints'), exist_ok=True)
+    
+        torch.save(
+            model_dict, 
+            os.path.join(path, 'checkpoints', f'model_best.pth')
+        )
+
+        # torch.save(
+        #     self.metrics,
+        #     os.path.join(path, 'checkpoints', f'metrics_best.pth')
+        # )
+
+
+    def _load_from_model_dir(self, model_dir):
+        checkpoint = torch.load(model_dir)
+
+        self.model['transition_model'].load_state_dict(checkpoint['transition_model'])
+        self.model['observation_model'].load_state_dict(checkpoint['observation_model'])
+        self.model['reward_model'].load_state_dict(checkpoint['reward_model'])
+        self.model['encoder'].load_state_dict(checkpoint['encoder'])
+        self.optimiser.load_state_dict(checkpoint['optimiser'])
+        if 'lr_scheduler' in checkpoint and checkpoint['lr_scheduler'] is not None and getattr(self, 'lr_scheduler', None) is not None:
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            
+        self.loaded = True
+             
+    def load(self, path=None):
+
+        if path is None:
+            path = self.save_dir
+        
+        checkpoint_dir = os.path.join(path, 'checkpoints')
+
+        ## find the latest checkpoint
+        if not os.path.exists(checkpoint_dir):
+            print('[RSSM.load] No checkpoint found in directory {}'.format(checkpoint_dir))
+            return 0
+        
+        # Get all items in directory
+        raw_items = os.listdir(checkpoint_dir)
+        
+        # Filter: only keep items that start with 'model_' and end with '.pth'
+        # This automatically ignores 'best', 'checkpoint.txt', and other subdirectories
+        checkpoints = []
+        for c in raw_items:
+            if c.startswith('model_') and c.endswith('.pth'):
+                try:
+                    # Extract number from 'model_100.pth' -> 100
+                    checkpoint_id = int(c.split('_')[1].split('.')[0])
+                    checkpoints.append(checkpoint_id)
+                except (ValueError, IndexError):
+                    continue # Skip anything that doesn't fit the pattern
+
+        if not checkpoints:
+            print(f'[RSSM, load] No valid numbered checkpoints found in {checkpoint_dir}')
+            return 0
+            
+        checkpoints.sort()
+        checkpoint = checkpoints[-1]
+
+        model_dir = os.path.join(checkpoint_dir, f'model_{checkpoint}.pth')
+
+        
+        if not os.path.exists(model_dir):
+            print('[RSSM, load] No model found for loading in directory {}'.format(model_dir))
+            return 0
+        
+        self._load_from_model_dir(model_dir)
+        print('[RSSM, load] Loaded checkpoint {}'.format(checkpoint))
+        self.loaded = True
+        return checkpoint
+
+    
+    def load_best(self):
+
+        path = self.save_dir
+        
+        checkpoint_dir = os.path.join(path, 'checkpoints')
+
+        ## find the latest checkpoint
+        if not os.path.exists(checkpoint_dir):
+            print('No checkpoint found in directory {}'.format(checkpoint_dir))
+            return 0
+        
+        # checkpoints = os.listdir(checkpoint_dir)
+        # checkpoints = [int(c.split('_')[1].split('.')[0]) for c in checkpoints]
+        # checkpoints.sort()
+        # checkpoint = checkpoints[-1]
+        model_dir = os.path.join(checkpoint_dir, f'model_best.pth')
+
+        
+        if not os.path.exists(model_dir):
+            print('[lagarnet, load_best] No model found for loading in directory {}'.format(model_dir))
+            return 0
+        
+        self._load_from_model_dir(model_dir)
+        print('[LaGarNet, load_best] Successfully loaded the best model in directory {}'.format(model_dir))
+        self.loaded = True
+        return -2
+        
+    def load_checkpoint(self, checkpoint: int) -> bool:
+        checkpoint_dir = os.path.join(self.save_dir, 'checkpoints')
+        model_dir = os.path.join(checkpoint_dir, f'model_{checkpoint}.pth')
+        if not os.path.exists(model_dir):
+            print('No model found for loading in directory {}'.format(model_dir))
+            return False
+        self._load_from_model_dir(model_dir)
+        print('[lagarnet, load_checkpoint] Loaded checkpoint {}'.format(checkpoint))
+        return True
+    
+    # def _load_metrics(self, path=None):
+
+    #     if path is None:
+    #         path = self.save_dir
+        
+    #     if not os.path.exists(os.path.join(path, 'checkpoint', 'metrics.pth')):
+    #         return {}
+        
+    #     return torch.load(os.path.join(path, 'checkpoint', 'metrics.pth'))
+
+    def _preprocess(self, data, train=False, single=False, apply_transform=True):
+
+        
+
+        if self.config.datasets[0].name == 'default':
+            if 'observation' in data:
+                obs_data = data['observation']
+                act_data = data['action']['default']
+                if self.apply_reward_processor:
+                    rewards = self.reward_processor(data['observation']['reward'], obs_data, act_data, self.config.reward_config)
+            else:
+                obs_data = data
+                act_data = data['action']
+                if self.apply_reward_processor:
+                    rewards = self.reward_processor(data['reward'], obs_data, act_data, self.config.reward_config)
+            
+           
+           
+            data = {
+                'action': act_data,
+            }
+            data.update(obs_data)
+            rewards = data['reward']
+            
+            if single:
+                data['reward'] = rewards[1:].squeeze(-1)
+                data['terminal'] = data['terminal'][1:].squeeze(-1)
+            else:
+                data['reward'] = rewards[:, 1:].squeeze(-1)
+                data['terminal'] = data['terminal'][:, 1:].squeeze(-1)
+        
+        
+
+        
+        # Apply transformations
+        if apply_transform:
+            if single and not self.apply_transform_in_dataset:
+                for k, v in data.items():
+                    data[k] = np.expand_dims(v, 0)
+            data =  self.data_augmenter(data, train=train)
+            if self.apply_transform_in_dataset:
+                for k, v in data.items():
+                    data[k] = v.unsqueeze(0)
+            for k, v in data.items():
+                data[k] = v.to(self.config.device)
+
+        # Swap axes for all items in data
+        for k in data:
+            data[k] = torch.swapaxes(data[k], 0, 1)
+
+        # Precompute shapes if needed
+        if self.config.input_obs == 'rgbd':
+            T, B, C, H, W = data['rgb'].shape
+            # Concatenate and apply symlog transformation
+            rgbd = torch.cat([data['rgb'], data['depth']], dim=2)
+            data['input_obs'] = symlog(rgbd, self.symlog)
+        elif self.config.input_obs == 'gc-depth':
+            gc_depth = torch.cat([data['depth'], data['goal-depth']], dim=2)
+            data['input_obs'] = symlog(gc_depth, self.symlog)
+        elif self.config.input_obs == 'rgb+goal-rgb':
+            gc_rgb = torch.cat([data['rgb'], data['goal-rgb']], dim=2)
+            data['input_obs'] = symlog(gc_rgb, self.symlog)
+        elif self.config.input_obs == 'rgb+goal-rgbd':
+            gc_rgbd = torch.cat([data['rgb'], data['depth'], data['goal-rgb'], data['goal-depth']], dim=2)
+            data['input_obs'] = symlog(gc_rgbd, self.symlog)
+        else:
+            data['input_obs'] = symlog(data[self.config.input_obs], self.symlog)
+
+        # Determine output observation based on configuration
+        if self.config.output_obs == 'input_obs':
+            data['output_obs'] = data['input_obs']
+        elif self.config.output_obs == 'rgbm':
+            rgbm = torch.cat([data['rgb'], data['mask']], dim=2)
+            data['output_obs'] = symlog(rgbm, self.symlog)
+        elif self.config.output_obs == 'mask+goal-mask':
+            gc_mask = torch.cat([data['mask'], data['goal-mask']], dim=2)
+            data['output_obs'] = symlog(gc_mask, self.symlog)
+        else:
+            data['output_obs'] = symlog(data[self.config.output_obs], self.symlog)
+
+        # Apply symlog to reward
+        if self.config.get('train_reward_clip', False):
+            clip_range = self.config.get('train_reward_clip')
+            data['reward'] = torch.clamp(data['reward'], clip_range[0], clip_range[1])
+        
+        data['reward'] = symlog(data['reward'], self.symlog)
+
+
+        return data
+    
+    # def train_online(self, env, explore_policy):
+    #     start_update_step = self.load()
+    #     metrics = self._load_metrics()
+    #     action_space = env.get_action_space()
+        
+    #     if metrics == {}:
+    #         metrics = {
+    #             'update_step': [],
+    #             # 'train_episodes': [],
+    #             # 'interactive_steps': [],
+    #             'update_step_at_train_episode': [],
+    #             'train_episodes_reward_mean': [],
+    #             'train_episodes_reward_std': [],
+    #             'update_step_at_test_episode': [],
+    #             'test_episodes_reward_mean': [],
+    #             'test_episodes_reward_std': []
+    #         }
+        
+        
+
+    #     self.memory = ExperienceReplay(
+    #         self.config.memory_size, 
+    #         self.config.symbolic_env, 
+    #         self.config.input_obs_dim, 
+    #         self.config.action_dim,  
+    #         self.config.device)
+
+    #     experience_dir = os.path.join(self.save_dir, 'model/experience.pkl')
+    #     if self.config.checkpoint_experience and os.path.exists(experience_dir):
+    #         self.memory.load(experience_dir)
+    
+        
+        
+    #     ## Initial data collection
+    #     # if start_update_step == 0 and start_update_step < self.config.total_update_steps:
+    #     env.set_train()
+    #     with torch.no_grad():
+    #         update = start_update_step
+    #         total_rewards = []
+    #         #s = train_episodes
+    #         for _ in tqdm(range(self.memory.episodes, self.config.intial_train_episodes), 
+    #                         desc="Collecting Initial Training Epsiodes"):
+    #             #train_episodes += 1
+    #             information, total_reward = env.reset(), 0
+    #             obs = information['observation']['rgb']
+                
+
+    #             while not information['done']:
+    #                 action = env.sample_random_action()
+    #                 information = env.step(action)
+    #                 # *self.config.input_obs_dim[1:]
+    #                 obs = cv2.resize(obs, (64, 64) , interpolation=cv2.INTER_LINEAR)
+    #                 mpimg.imsave(
+    #                     os.path.join(self.save_dir, 'train_online.png'), obs)
+    #                 self.memory.append(
+    #                     obs.transpose(2, 0, 1), 
+    #                     action, 
+    #                     information['reward'], 
+    #                     information['done'])
+    #                 obs = information['observation']['rgb']
+                    
+    #                 total_reward += information['reward']
+    #             #interactive_steps += env.get_max_interactive_steps()
+                
+    #             total_rewards.append(total_reward)
+
+    #         metrics['update_step_at_train_episode'].append(update)
+    #         metrics['train_episodes_reward_mean'].append(np.mean(total_rewards))
+    #         metrics['train_episodes_reward_std'].append(np.std(total_rewards))
+            
+
+    #         print('Average running reward {} at update step {}/{}'\
+    #             .format(np.mean(total_rewards), update, self.config.total_update_steps))
+        
+    #     self.set_train()
+    #     for update in tqdm(range(start_update_step+1, self.config.total_update_steps), desc='Updateing RSSM'):
+
+    #         # Test Policy in the Env
+    #         if update%self.config.test_interval == 0:
+    #             self.metrics = metrics
+    #             self.save()
+    #             self.set_eval()
+    #             total_rewards = []
+    #             # TODO: change explore policy to test policy
+    #             env.set_eval()
+    #             for e in tqdm(range(self.config.test_episodes), desc="Testing Epsiodes"):
+    #                 information, total_reward = env.reset(episode_config={'eid': e, 'save_video': False}), 0
+    #                 explore_policy.init_state(information)
+
+    #                 while not information['done']:
+    #                     mpimg.imsave(
+    #                         os.path.join(self.save_dir, 'test_online.png'),
+    #                         information['observation']['rgb'])
+                        
+    #                     action = explore_policy.act(information, env)
+    #                     information = env.step(action)
+    #                     total_reward += information['reward']
+
+    #                     explore_policy.update(information, action)
+
+    #                 total_rewards.append(total_reward)
+                    
+                    
+    #             metrics['update_step_at_test_episode'].append(update)
+    #             metrics['test_episodes_reward_mean'].append(np.mean(total_rewards))
+    #             metrics['test_episodes_reward_std'].append(np.std(total_rewards))
+
+    #             print('Test average reward {} at update step {}/{}'\
+    #                   .format(np.mean(total_rewards), update, self.config.total_update_steps))
+
+                
+    #             self.set_train()
+            
+
+    #         # Train RSSM
+    #         data = self.memory.sample(self.config.batch_size, self.config.sequence_size)
+    #         #print('sample rgb shape', data['rgb'].shape)
+    #         for k, v in data.items():
+    #             if k != 'rgb':
+    #                 data[k] = v[:-1]
+    #             data[k] = np.transpose(v, (1, 0, *range(2, v.ndim)))
+
+    #         data = self._preprocess(data, train=True)
+
+    #         self.optimiser.zero_grad()
+
+    #         losses = self.compute_losses(data, update)
+            
+
+    #         losses['total_loss'].backward()
+    #         nn.utils.clip_grad_norm_(self.param_list, self.config.grad_clip_norm, norm_type=2)
+    #         self.optimiser.step()
+
+    #         if self.lr_scheduler is not None:
+    #             self.lr_scheduler.step()
+
+    #         # Collect Losses
+    #         for kk, vv in losses.items():
+    #             if kk in metrics.keys():
+    #                 metrics[kk].append(vv.detach().cpu().item())
+    #             else:
+    #                 metrics[kk] = [vv.detach().cpu().item()]
+    #         metrics['update_step'].append(update)
+
+    #         # Collect episode data
+    #         if update%self.config.collect_interval == self.config.collect_interval-1:
+    #             # self.save_checkpoint(
+    #             #     metrics,                
+    #             #     self.config.models_dir)
+    #             env.set_train()
+    #             with torch.no_grad():
+    #                 total_rewards = []
+    #                 print('Total loss {} at update step {}'.\
+    #                       format(metrics['total_loss'][-1], metrics['update_step'][-1]))
+
+    #                 for _ in tqdm(range(self.config.train_episodes), desc="Collecting Training Epsiodes"):
+
+    #                     information, total_reward = env.reset(), 0
+    #                     obs = information['observation']['rgb']
+    #                     explore_policy.init(information)
+                        
+
+    #                     while not information['done']:
+                            
+    #                         action = explore_policy.act(information, env)
+    #                         action += np.random.normal(size=action.shape)*self.config.action_noise
+    #                         action = action.clip(action_space.low, action_space.high)
+    #                         information = env.step(action)
+    #                         explore_policy.update_state(information, action)
+
+
+    #                         obs = cv2.resize(obs, (64, 64) , interpolation=cv2.INTER_LINEAR)
+    #                         mpimg.imsave(
+    #                             os.path.join(self.save_dir, 'train_online.png'), obs)
+    #                         self.memory.append(
+    #                             obs.transpose(2, 0, 1), 
+    #                             action, 
+    #                             information['reward'], 
+    #                             information['done'])
+                        
+    #                         obs = information['observation']['rgb']
+    #                         total_reward += information['reward']                           
+                        
+    #                     total_rewards.append(total_reward)
+
+    #                 metrics['update_step_at_train_episode'].append(update)
+    #                 metrics['train_episodes_reward_mean'].append(np.mean(total_rewards))
+    #                 metrics['train_episodes_reward_std'].append(np.std(total_rewards))
+
+    #                 print('Average running reward {} at update step {}/{}'\
+    #                     .format(np.mean(total_rewards), update, self.config.total_update_steps))
+
+
+    def train_online(self, env, explore_policy, update_steps):
+        start_update_step = self.load() + 1
+        action_space = env.get_action_space()
+        
+        # 1. Initialize self.memory using your custom dataset class
+        if getattr(self, 'datasets', None) is None:
+            datasets = {}
+            if 'datasets' in self.config:
+                for dataset_dict in self.config['datasets']:
+                    key = dataset_dict['key']
+                    print(f"Initializing dataset '{key}' from name '{dataset_dict['name']}' for online memory")
+                    dataset_params = dataset_dict['params']
+                    
+                    # Initialize the custom dataset (starts clean)
+                    dataset = name_to_dataset[dataset_dict['name']](**dataset_params)
+                    datasets[key] = dataset
+            else:
+                raise NotImplementedError("Config must contain 'datasets' definitions.")
+
+            for key, dataset in datasets.items():
+                if self.apply_transform_in_dataset:
+                    dataset.set_transform(self.data_augmenter)
+            self.datasets = datasets
+            
+        # Assign the train dataset to act as our online memory buffer
+        self.memory = self.datasets['train']
+
+        
+
+        ## Initial data collection
+        env.set_train()
+        with torch.no_grad():
+            update = start_update_step
+            total_rewards = []
+            
+            # Use getattr to safely check for episodes attribute, default to 0 if clean
+            current_episodes = self.memory.num_trajectories()
+            
+            for _ in tqdm(range(current_episodes, self.config.get('intial_train_episodes', 10)), 
+                            desc="Collecting Initial Training Episodes"):
+                
+                information, total_reward = env.reset(), 0
+                
+                while not information['done']:
+                    action = env.sample_random_action()
+                    information = env.step(action)
+                    
+                    
+                    # Pass the full dictionary of observations and action to your dataset's append method
+                    obs_to_add = information['observation'].copy()
+                    obs_to_add['reward'] = np.array([information['reward'][self.config.reward_key]], dtype=np.float32)
+                    
+                    # Format action as a dict expected by act_config
+                    act_to_add = {'default': action}
+
+                    self.memory.add_transition(
+                        observation=obs_to_add, 
+                        action=act_to_add, 
+                        done=information['done']
+                    )
+                    
+                    total_reward += information['reward'][self.config.reward_key]
+                
+                total_rewards.append(total_reward)
+
+            if total_rewards:
+                # ---> ADDED LOGGING HERE FOR INITIAL COLLECTION <---
+                self.logger.log({
+                    'train_episodes_reward_mean': np.mean(total_rewards),
+                    'train_episodes_reward_std': np.std(total_rewards)
+                }, step=update)
+                print('Average running reward {} at update step {}/{}'\
+                    .format(np.mean(total_rewards), update, self.config.total_update_steps))
+        
+        train_dataloader = DataLoader(
+            self.memory ,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.get('dataloader_workers', 0),
+            shuffle=True)
+        self.set_train()
+        for update in tqdm(range(start_update_step, start_update_step+update_steps), desc='Training agent'):
+            
+            # Train RSSM
+            self.update_step = update
+            # Ensure your dataset class supports .sample(batch_size, sequence_size)
+            data = next(iter(train_dataloader))
+            data = {k: v.to(self.config.device, non_blocking=True) for k,v in data.items()}
+
+            # Preprocess to feed into GC_RSSM
+            data = self._preprocess(data, train=True, apply_transform=(not self.apply_transform_in_dataset))
+
+            self.optimiser.zero_grad()
+            losses = self.compute_losses(data, update)
+            losses['total_loss'].backward()
+            nn.utils.clip_grad_norm_(self.param_list, self.config.grad_clip_norm, norm_type=2)
+            self.optimiser.step()
+
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+
+            # ---> ADDED LOGGING HERE FOR NETWORK LOSSES <---
+            wandb_metrics = {}
+            for kk, vv in losses.items():
+                wandb_metrics[kk] = vv.detach().cpu().item()
+            
+            self.logger.log(wandb_metrics, step=update)
+            # -----------------------------------------------
+
+            # Collect episode data interactively
+            if update % self.config.get('collect_interval', 100) == self.config.get('collect_interval', 100) - 1:
+                env.set_train()
+                with torch.no_grad():
+                    total_rewards = []
+
+                    for _ in tqdm(range(self.config.get('train_episodes', 1)), desc="Collecting Training Episodes"):
+                        information, total_reward = env.reset(), 0
+                        
+                        explore_policy.reset([0])
+                        explore_policy.init([information])
+
+                        while not information['done']:
+                            action = explore_policy.single_act(information).flatten()
+                            action += np.random.normal(size=action.shape) * self.config.get('action_noise', 0.1)
+                            action = action.clip(action_space.low, action_space.high)
+                            
+                            information = env.step(action)
+                            explore_policy.update([information], [action])
+                                
+                            # Pass the full dictionary of observations and action to your dataset's append method
+                            obs_to_add = information['observation'].copy()
+                            obs_to_add['reward'] = np.array([information['reward'][self.config.reward_key]], dtype=np.float32)
+                            
+                            # Format action as a dict expected by act_config
+                            act_to_add = {'default': action}
+
+                            self.memory.add_transition(
+                                observation=obs_to_add, 
+                                action=act_to_add, 
+                                done=information['done']
+                            )
+                                
+                            total_reward += information['reward'][self.config.reward_key]                        
+                        
+                        total_rewards.append(total_reward)
+
+                    # ---> ADDED LOGGING HERE FOR INTERACTIVE EPISODE REWARDS <---
+                    if total_rewards:
+                        reward_metrics = {
+                            'train_episodes_reward_mean': np.mean(total_rewards),
+                            'train_episodes_reward_std': np.std(total_rewards)
+                        }
+                        self.logger.log(reward_metrics, step=update)
+                        print('Average running reward {} at update step {}/{}'\
+                            .format(np.mean(total_rewards), update, self.config.total_update_steps))
+                    # ------------------------------------------------------------
+
+                train_dataloader = DataLoader(
+                    self.memory,
+                    batch_size=self.config.batch_size,
+                    num_workers=self.config.get('dataloader_workers', 0),
+                    shuffle=True)
+      
+    def _train_offline(self, datasets, update_steps=-1):
+        
+        train_dataset = datasets['train']
+        test_dataset = datasets['test']
+        # self.transform=test_dataset.transform
+        
+        losses_dict = {}
+        updates = []
+        start_step = self.load()
+
+        self.set_train()
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.get('dataloader_workers', 0),
+            shuffle=True)
+
+
+        end_update_steps = self.config.total_update_steps if update_steps == -1 \
+            else min(start_step+update_steps+1, self.config.total_update_steps)
+
+        for u in tqdm(range(start_step, end_update_steps )):
+            self.update_step = u
+        
+            data = next(iter(train_dataloader))
+
+            data = {k: v.to(self.config.device, non_blocking=True) for k,v in data.items()}
+
+            if self.data_sampler in ['prioritised', 'count-based']:
+                indices = ts_to_np(data['idx'])
+                data.pop('idx')
+                
+
+            data = self._preprocess(data, train=True, apply_transform=(not self.apply_transform_in_dataset))
+            
+            if self.data_sampler == 'prioritised':
+                data['weights'] = np_to_ts(train_dataset.get_weights(indices), self.config.device)
+
+            
+
+            self.optimiser.zero_grad()
+
+            losses = self.compute_losses(data, u)
+
+            if self.data_sampler == 'prioritised':
+                #print('here!!!')
+                batch_reward_losses = ts_to_np(losses['batch_reward_losses'])
+                losses.pop('batch_reward_losses')
+                batch_observation_losses = ts_to_np(losses['batch_observation_losses'])
+                losses.pop('batch_observation_losses')
+                train_dataset.update_priorities(indices, batch_observation_losses)
+            elif self.data_sampler == 'count-based':
+                train_dataset.update_counts(indices)
+            
+
+            losses['total_loss'].backward()
+            nn.utils.clip_grad_norm_(self.param_list, self.config.grad_clip_norm, norm_type=2)
+            self.optimiser.step()
+
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+
+            # Collect Losses
+            wandb_metrics = {}
+            for kk, vv in losses.items():
+                #print('kk', kk)
+                if kk in losses_dict.keys():
+                    losses_dict[kk].append(vv.detach().cpu().item())
+                else:
+                    losses_dict[kk] = [vv.detach().cpu().item()]
+                wandb_metrics[kk] = vv.detach().cpu().item()
+            
+            self.logger.log(wandb_metrics, u)
+
+            updates.append(u)
+        
+    def evaluate(self, dataset, train=False):
+
+        reward_rmses = {h:[] for h in self.config.test_horizons}
+        observation_mses = {h:[] for h in self.config.test_horizons}
+        kls_post_to_prior = {h:[] for h in self.config.test_horizons}
+        kls_prior_to_post = {h:[] for h in self.config.test_horizons}
+        prior_entropies = {h:[] for h in self.config.test_horizons}
+        posterior_reward_rmses = []
+        posterior_recon_mses = []
+        posterior_entropies = []
+        eval_action_horizon = self.config.eval_action_horizon
+        
+        for i in tqdm(range(self.config.eval_episodes)):
+            episode = dataset.get_trajectory(i)
+
+            #print('\n!!!!!!!!!!!!!!!!')
+            episode = self._preprocess(episode, train=False, single=True, apply_transform=True)
+            #for k, v in episode.items():
+                #episode[k] = torch.swapaxes(v, 0, 1) #.squeeze(0)
+            #print('episode input obs shape', episode['input_obs'].shape)
+            #print(k, episode[k].shape)
+            no_op_action = np_to_ts(self.no_op, self.config.device).unsqueeze(0).unsqueeze(0)
+            #print('no_op_action shape', no_op_action.shape)
+            episode['actions'] = torch.cat([no_op_action,
+                 episode['action'][:eval_action_horizon]], dim=0)
+
+            beliefs, posteriors, priors, obs_embedding = self._unroll_state_action(
+                episode, horizon=eval_action_horizon, batch_size=1)
+
+            # init_belief = torch.zeros(1, self.config.deterministic_latent_dim).to(self.config.device)
+            # init_state = torch.zeros(1, self.config.stochastic_latent_dim).to(self.config.device)
+
+            # no_op_ts = np_to_ts(self.no_op, self.config.device).unsqueeze(0)
+            actions = episode['action'][:eval_action_horizon]
+
+            # actions = torch.cat([no_op_ts, actions])
+            
+            # input_obs = episode['input_obs'][:eval_action_horizon+1]
+            output_obs = episode['output_obs'][:eval_action_horizon+1]
+
+            rewards = episode['reward'][:eval_action_horizon]
+
+            # beliefs, posteriors, priors, obs_embedding = self._unroll_state_action(
+            #     episode, horizon=eval_action_horizon, batch_size=1)
+                # input_obs.unsqueeze(1), actions.unsqueeze(1), init_belief, init_state, 
+                # None)
+            
+            if ('eval_save_latent' in self.config) and self.config.eval_save_latent and (not train):
+                data = {
+                    'belief': ts_to_np(beliefs),
+                    'posterior': ts_to_np(posteriors['mean']),
+                    'one-step prior': ts_to_np(priors['mean'])
+                }
+                latent_dir = os.path.join(self.save_dir, 'latent_space')
+                os.makedirs(latent_dir, exist_ok=True)
+                torch.save(
+                    data,
+                    os.path.join(latent_dir, 'evaldata_episode_{}.pth'.format(i))
+                )
+
+            if ('eval_save_obs_embedding' in self.config) and self.config.eval_save_obs_embedding and (not train):
+                data = {}
+                for k, v in obs_embedding.items():
+                    data[k] = ts_to_np(v)
+                
+                latent_dir = os.path.join(self.save_dir, 'emb_space')
+                os.makedirs(latent_dir, exist_ok=True)
+                torch.save(
+                    data,
+                    os.path.join(latent_dir, 'evaldata_episode_{}.pth'.format(i))
+                )
+            
+
+            posterior_reward =  bottle(self.model['reward_model'], 
+                                       (beliefs[1:], posteriors['sample'][1:]))\
+                                        .transpose(0, 1).squeeze(0)
+            
+            posterior_observation = bottle(self.model['observation_model'], 
+                                           (beliefs[1:], posteriors['sample'][1:]))\
+                                            .transpose(0, 1).squeeze(0)
+
+            post_dist = ContDist(td.independent.Independent(
+                td.normal.Normal(posteriors['mean'][1:], posteriors['std'][1:]), 1))
+            
+        
+
+
+            posterior_entropies.extend(post_dist.entropy().mean(dim=-1).flatten().detach().cpu().tolist())
+
+            posterior_reward_rmses.extend((F.mse_loss(
+                        symexp(posterior_reward, self.symlog), 
+                        symexp(rewards, self.symlog), 
+                        reduction='none')**0.5).flatten().detach().cpu().tolist())
+            
+            posterior_recon_mses.extend(F.mse_loss(
+                        symexp(posterior_observation, self.symlog),
+                        symexp(output_obs[1:], self.symlog),
+                        reduction='none').mean((1, 2, 3)).flatten().detach().cpu().tolist())
+
+            
+
+        res = {
+            'posterior_img_observation_mse_mean': np.mean(posterior_recon_mses),
+            'posterior_img_observation_mse_std': np.std(posterior_recon_mses),
+            'posterior_reward_rmse_mean': np.mean(posterior_reward_rmses),
+            'posterior_reward_rmse_std': np.std(posterior_reward_rmses),
+            'posterior_entropy_mean': np.mean(posterior_entropies),
+            'posterior_entropy_std': np.std(posterior_entropies)
+        }
+        
+        return res
+    
+
+    def _unroll_state_action(self, data, horizon=None, batch_size=None):
+        
+
+        init_belief = torch.zeros(
+            self.config.batch_size if batch_size is None else batch_size,
+            self.config.deterministic_latent_dim).to(self.config.device)
+
+        init_state = torch.zeros(
+            self.config.batch_size if batch_size is None else batch_size,
+            self.config.stochastic_latent_dim).to(self.config.device)
+        
+        if horizon == None:
+            horizon = len(data['action'])
+        
+        actions = data['action'][:horizon]
+        non_terminals = (1 - data['terminal'])[:horizon].unsqueeze(-1)
+        #rewards = data['reward']
+        input_obs = data['input_obs'][:horizon]
+        # goal_obs = data['goal_obs'][:horizon]
+        #output_obs = data['output_obs']
+
+
+        obs_emb = {}
+        obs_emb['emb'] = self.model['encoder'](input_obs)
+        #obs_emb['goal-emb'] = self.model['encoder'](goal_obs)
+
+        blfs, prior_states_, prior_means_, prior_std_devs_, posterior_states_, posterior_means_, posterior_std_devs_ = \
+            self.model['transition_model'](
+                init_state, 
+                actions,
+                init_belief,
+                obs_emb['emb'], 
+                non_terminals)
+        #print('blfs', blfs.shape)
+
+        posteriors_ = {
+            'sample': posterior_states_,
+            'mean': posterior_means_,
+            'std': posterior_std_devs_
+        }
+
+        priors_ = {
+            'sample': prior_states_,
+            'mean': prior_means_,
+            'std': prior_std_devs_
+        }
+        
+        return blfs, posteriors_, priors_, obs_emb
+    
+    def get_writer(self):
+        return self.logger
+
+    def unroll_state_action(self, state, action):
+
+        #print('action shape', action.shape)
+
+        blfs, prior_states_, prior_means_, prior_std_devs_, posterior_states_, posterior_means_, posterior_std_devs_ = \
+            self.model['transition_model'](
+                
+                state['stoch']['sample'],
+                action, 
+                state['deter'], 
+                self.model['encoder'](state['input_obs']), 
+                None)
+
+        posteriors_ = {
+            'sample': posterior_states_,
+            'mean': posterior_means_,
+            'std': posterior_std_devs_
+        }
+
+        last_post = {
+            'deter': blfs[-1],
+            'stoch': {
+                'sample': posterior_states_[-1],
+                'mean': posterior_means_[-1],
+                'std': posterior_std_devs_[-1]
+            }
+            
+
+        }
+
+        return {
+            'deter': blfs,
+            'stoch': posteriors_
+        }, last_post
+    
+    
+    
+
+    def _unroll_action(self, actions, belief_, latent_state_):
+
+
+        img_beliefs_, prior_states_, prior_means_, prior_std_devs_  = \
+            self.model['transition_model'](
+                latent_state_, 
+                actions, 
+                belief_, 
+                None,
+                None)
+
+        priors_ = {
+            'sample': prior_states_,
+            'mean': prior_means_,
+            'std': prior_std_devs_
+        }
+        
+        return img_beliefs_, priors_
+
+    def unroll_action(self, init_state, actions):
+        img_beliefs_, prior_states_, prior_means_, prior_std_devs_  = \
+            self.model['transition_model'](
+                init_state['stoch']['sample'], 
+                actions, 
+                init_state['deter'], 
+                None,
+                    None)
+        
+        return {
+            'deter': img_beliefs_,
+            'stoch': {
+                'sample': prior_states_,
+                'mean': prior_means_,
+                'std': prior_std_devs_
+            }
+        }
+
+    def unscaled_overshooting_losses(self, experience, beliefs, posteriors):
+        if self.config.kl_overshooting_scale == 0:
+            return torch.tensor(0).to(self.config.device), torch.tensor(0).to(self.config.device)
+
+        actions = experience['action']
+        non_terminals = 1 - experience['terminal']
+        rewards = experience['reward']
+
+        
+        overshooting_vars = [] 
+        for t in range(1, self.config.sequence_size - 1):
+            d = min(t + self.config.overshooting_distance, self.config.sequence_size - 1)  # Overshooting distance
+            t_, d_ = t - 1, d - 1  # Use t_ and d_ to deal with different time indexing for latent states
+            seq_pad = (0, 0, 0, 0, 0, t - d + self.config.overshooting_distance)  # Calculate sequence padding so overshooting terms can be calculated in one batch
+
+            # Store (0) actions, (1) nonterminals, (2) rewards, (3) beliefs, (4) posterior states, (5) posterior means, (6) posterior standard deviations and (7) sequence masks
+            overshooting_vars.append((
+                F.pad(actions[t:d], seq_pad), 
+                F.pad(non_terminals[t:d].unsqueeze(2), seq_pad), 
+                F.pad(rewards[t:d], seq_pad[2:]), 
+                beliefs[t_], 
+                posteriors['sample'][t_].detach(), 
+                F.pad(posteriors['mean'][t_ + 1:d_ + 1].detach(), seq_pad), 
+                F.pad(posteriors['std'][t_ + 1:d_ + 1].detach(), seq_pad, value=1), 
+                F.pad(torch.ones(d - t, self.config.batch_size, self.config.stochastic_latent_dim, device=self.config.device), seq_pad)
+            ))  # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
+        
+
+        overshooting_vars = tuple(zip(*overshooting_vars))
+        
+
+        # Update belief/state using prior from previous belief/state and previous action (over entire sequence at once)
+        beliefs, prior_states, prior_means, prior_std_devs = self.model['transition_model'](
+            torch.cat(overshooting_vars[4], dim=0), 
+            torch.cat(overshooting_vars[0], dim=1), 
+            torch.cat(overshooting_vars[3], dim=0), 
+            None, 
+            torch.cat(overshooting_vars[1], dim=1))
+
+        reward_seq_mask = torch.cat(overshooting_vars[7], dim=1)
+        
+        
+
+        # Calculate overshooting KL loss with sequence mask
+
+        posteriors = {
+            'mean': torch.cat(overshooting_vars[5], dim=1), 
+            'std': torch.cat(overshooting_vars[6], dim=1)}
+        
+        priors = {
+            'mean': prior_means, 
+            'std': prior_std_devs}
+
+        kl_overshooting_loss  = self.compute_kl_loss(
+            posteriors, priors, 
+            self.config.kl_overshooting_balance, 
+            free=self.config.free_nats)
+
+
+        if self.config.reward_overshooting_scale != 0:
+           
+            if self.config.reward_gradient_stop:
+                reward_overshooting_loss = F.mse_loss(
+                    bottle(self.model['reward_model'],
+                    (beliefs.detach(), prior_states.detach())) * reward_seq_mask[:, :, 0], 
+                    torch.cat(overshooting_vars[2], dim=1), reduction='none').mean()
+            else:
+                reward_overshooting_loss = F.mse_loss(
+                        bottle(self.model['reward_model'], 
+                        (beliefs, prior_states)) * reward_seq_mask[:, :, 0], 
+                        torch.cat(overshooting_vars[2], dim=1), 
+                        reduction='none').mean()
+
+        else:
+            reward_overshooting_loss = torch.tensor(0).to(self.config.device)
+
+        
+        
+        return kl_overshooting_loss, reward_overshooting_loss
+
+    def compute_kl_loss(self, post, prior, balance=0.8, forward=False, free=1.0):
+        ## print shapes of post and prior
+        # print('post mean shape', post['mean'].shape)
+        # print('prior mean shape', prior['mean'].shape)
+        # print('post std shape', post['std'].shape)
+        # print('prior std shape', prior['std'].shape)
+
+        if self.config.kl_balancing:
+            kld = td.kl.kl_divergence
+            sg = lambda x: {k: v.detach() for k, v in x.items()}
+            lhs, rhs = (prior, post) if forward else (post, prior)
+            sg_lhs, sg_rhs = sg(lhs), sg(rhs)
+            
+            lhs = ContDist(td.independent.Independent(
+                    td.normal.Normal(lhs['mean'],lhs['std']), 1))
+            sg_lhs = ContDist(td.independent.Independent(
+                    td.normal.Normal(sg_lhs['mean'], sg_lhs['std']), 1))
+            rhs = ContDist(td.independent.Independent(
+                    td.normal.Normal(rhs['mean'],rhs['std']), 1))
+            sg_rhs = ContDist(td.independent.Independent(
+                    td.normal.Normal(sg_rhs['mean'], sg_rhs['std']), 1))
+
+            mix = balance if forward else (1 - balance)
+            value_lhs = kld(lhs._dist, sg_rhs._dist)
+            value_rhs = kld(sg_lhs._dist, rhs._dist)
+            
+            loss_lhs = torch.maximum(torch.mean(value_lhs), torch.Tensor([free])[0])
+            loss_rhs = torch.maximum(torch.mean(value_rhs), torch.Tensor([free])[0])
+            loss = mix * loss_lhs + (1 - mix) * loss_rhs
+        else:
+            
+            free_nats = torch.full((1, ), free, dtype=torch.float32, device=self.config.device)
+            
+            loss = torch.max(
+                kl_divergence(
+                    Normal(post['mean'], post['std']), 
+                    Normal(prior['mean'], prior['std'])).sum(dim=2), 
+                free_nats).mean(dim=(0, 1))
+            
+
+        return loss
+    
+    def compute_losses(self, data, steps):
+        
+      
+        data['input_obs'] = data['input_obs'][1:] # T * B
+
+        #print('data[input_obs] shape', data['input_obs'].shape) 
+       
+        rewards = data['reward']
+      
+        output_obs = data['output_obs']
+        #print('data[output_obs] shape', data['output_obs'].shape) 
+
+
+        beliefs, posteriors, priors, _ = self._unroll_state_action(data)
+        
+        recon = bottle(self.model['observation_model'], (beliefs, posteriors['sample']))
+
+        # =========================================================
+        # ADD THIS DEBUG BLOCK HERE
+        # =========================================================
+        if self.debug:  # Saves every 100 steps to avoid disk spam
+            import os
+            import matplotlib.pyplot as plt
+            
+            debug_dir = 'tmp/lagarnet_debug'
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            # Reverse symlog and grab sequence=0, batch=0
+            inp_ts = symexp(data['input_obs'][0, 0], self.symlog).detach().cpu()
+            goal_ts = symexp(data['goal_obs'][0, 0], self.symlog).detach().cpu()
+            out_ts = symexp(output_obs[1, 0], self.symlog).detach().cpu() 
+            rec_ts = symexp(recon[0, 0], self.symlog).detach().cpu()
+
+            def save_debug_img(tensor, base_name):
+                # Convert to numpy (H, W, C) and clip
+                img = tensor.numpy().transpose(1, 2, 0).clip(0, 1)
+                
+                # Split 6 channels into Obs and Goal (e.g., rgb+goal-rgb)
+                if img.shape[-1] == 6:
+                    plt.imsave(os.path.join(debug_dir, f'{base_name}_obs.jpg'), img[:, :, :3])
+                    plt.imsave(os.path.join(debug_dir, f'{base_name}_goal.jpg'), img[:, :, 3:])
+                # Split 4 channels into RGB and Depth
+                elif img.shape[-1] == 4:
+                    plt.imsave(os.path.join(debug_dir, f'{base_name}_rgb.jpg'), img[:, :, :3])
+                    plt.imsave(os.path.join(debug_dir, f'{base_name}_depth.jpg'), img[:, :, 3].repeat(3, axis=-1))
+                # Standard 1 or 3 channel image
+                else:
+                    if img.shape[-1] == 1:
+                        img = img.repeat(3, axis=-1)
+                    plt.imsave(os.path.join(debug_dir, f'{base_name}.jpg'), img)
+
+            # Execute saves
+            save_debug_img(inp_ts, f'input')
+            save_debug_img(goal_ts, f'goal')
+            save_debug_img(out_ts, f'output')
+            save_debug_img(rec_ts, f'recon')
+            # exit()
+        # =========================================================
+
+        #print('recon shape', recon.shape) 
+        observation_loss = F.mse_loss(
+            recon, 
+            output_obs[1:],
+            reduction='none')
+
+        batch_observation_loss = observation_loss[:, :, :, :, :].sum(dim=(2, 3, 4)).mean(dim=(0))
+        if self.data_sampler == 'prioritised':
+            observation_loss = (data['weights'] * batch_observation_loss).mean()
+        else:
+            observation_loss = batch_observation_loss.mean()
+
+        pred_rewards = bottle(self.model['reward_model'], (beliefs, posteriors['sample']))
+
+        if self.config.reward_gradient_stop:
+            pred_rewards = bottle(self.model['reward_model'], (beliefs.detach(), posteriors['sample'].detach()))
+        else:
+            pred_rewards = bottle(self.model['reward_model'], (beliefs, posteriors['sample']))
+
+        batch_reward_loss = F.mse_loss(
+            pred_rewards, 
+            rewards,
+            reduction='none').mean(dim=(0))
+        
+        # batch-wise reward losses
+        if self.data_sampler == 'prioritised':
+            reward_loss = (batch_reward_loss*data['weights']).mean()
+        else:
+            reward_loss = batch_reward_loss.mean()
+
+        kl_loss = self.compute_kl_loss(
+            posteriors, priors, 
+            self.config.kl_balance, free=self.config.free_nats)
+
+        posterior_entropy = td.normal.Normal(posteriors['mean'], posteriors['std']).entropy().mean().detach().cpu()
+        prior_entropy =  td.normal.Normal(priors['mean'], priors['std']).entropy().mean().detach().cpu()
+
+        # Overshooting
+        kl_overshooting_loss, reward_overshooting_loss = \
+                self.unscaled_overshooting_losses(data, beliefs, posteriors)
+
+        if self.config.kl_overshooting_warmup:
+            kl_overshooting_scale_ = 1.0*steps/self.config.total_update_steps*self.config.kl_overshooting_scale
+        else:
+            kl_overshooting_scale_= self.config.kl_overshooting_scale
+
+        if self.config.reward_overshooting_warmup:
+            reward_overshooting_scale_ = 1.0*steps/self.config.total_update_steps*self.config.reward_overshooting_scale
+        else:
+            reward_overshooting_scale_= self.config.reward_overshooting_scale
+
+        total_loss = self.config.observation_scale*observation_loss + \
+            self.config.reward_scale*reward_loss + \
+            self.config.kl_scale * kl_loss + \
+            kl_overshooting_scale_ * kl_overshooting_loss + \
+            reward_overshooting_scale_ * reward_overshooting_loss
+        
+        res = {
+            'obs_loss': observation_loss,
+            'reward_loss': reward_loss,
+            #'batch_reward_losses': batch_reward_loss,
+            'kl_loss': kl_loss,
+            "posterior_entropy": posterior_entropy,
+            "prior_entropy": prior_entropy,
+            "kl_overshooting_loss": kl_overshooting_loss,
+            "reward_overshooting_loss": reward_overshooting_loss
+        }
+
+        # if self.config.data_sampler == 'prioritised':
+        #     res['batch_reward_losses'] = batch_reward_loss
+        #     res['batch_observation_losses'] = batch_observation_loss
+        
+        if self.config.encoder_mode == 'contrastive':
+            
+            contrastive_loss = self.model['encoder'].compute_loss(
+                data['anchors'],
+                data['positives'])
+            
+            total_loss += self.config.contrastive_scale * contrastive_loss
+            res['contrastive_loss'] = contrastive_loss
+
+            if steps % self.config.update_contrastive_target_interval == 0:
+                self.model['encoder'].update_target()
+
+        res['total_loss'] =  total_loss
+
+        return res 

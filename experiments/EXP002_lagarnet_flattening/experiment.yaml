@@ -1,0 +1,47 @@
+id: EXP002
+name: LaGarNet garment flattening via latent-dynamics MPC
+description: >-
+  Goal-conditioned RSSM trained offline on 40k flattening episodes, used at evaluation time for
+  model-predictive control of single-arm pick-and-place.
+
+release: v0.1.0
+commit: TODO            # fill in at run time: git rev-parse HEAD
+
+config:
+  experiment: sim_exp/lagarnet/final_lagarnet_40000_eps
+  agent: agent/lagarnet/final_lagarnet_40000_eps
+  arena: arena/lagarnet/multi_longsleeve_single_picker_provide_semkey_pixel_no_success_stop_resol_64_add_goal_to_obs
+  task: task/lagarnet/flattening_overstretch_penalty_1_no_big_bonus
+
+platform:
+  simulator: SoftGym / PyFlex
+  robot: single simulated picker
+
+inputs:
+  dataset: all_garment_mix
+  dataset_location: ./data/datasets/
+  assets: assets.zip
+
+outputs:
+  location: ${GARMENT_DATA_ROOT}/bimanual_garment_folding/final_lagarnet_40000_eps/
+  artefacts:
+    - checkpoints
+    - evaluation metrics (CSV)
+    - episode videos
+
+metrics:
+  - normalised_coverage
+  - max_IoU
+  - success_rate
+
+run: ./run.sh
+
+related:
+  dataset_size_ablation: sim_exp/lagarnet/final_lagarnet_{100,500,1000,10000,40000}_eps
+  reward_ablation: sim_exp/lagarnet/final_lagarnet_{cf,l2u,pc,sfa}_reward
+  horizon_ablation: tool/hydra_horizon_ablation.py
+
+known_limitations:
+  - Dataset is not yet publicly hosted.
+  - Flattening only.
+  - MPC evaluation is slow relative to a feed-forward policy.

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Scope note: PyFlex needs a GPU and an extension compiled against a specific CUDA version,
+# neither of which hosted runners provide, so simulation is not exercised here. CI covers what
+# it can check honestly: the code byte-compiles, unit tests pass, and every shipped experiment
+# config composes. Simulation and hardware checks are run locally before a release tag.
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: Install test dependencies
+        # Deliberately minimal: torch, PyFlex and actoris_harena are not needed to compose
+        # configs, and installing them would make CI slow and fragile.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest hydra-core omegaconf pyyaml ruff
+
+      - name: Byte-compile all sources
+        run: |
+          python -m compileall -q controllers env tool registration real_robot \
+                                  data_augmentation perception tests
+
+      - name: Lint (syntax errors and undefined names only)
+        run: ruff check --select E9,F63,F7,F82 .
+
+      - name: Unit tests and config composition
+        run: python -m pytest tests/unit -q
+
+      - name: Check experiment records are complete
+        run: |
+          for d in experiments/EXP*/; do
+            for f in README.md experiment.yaml run.sh; do
+              test -f "$d$f" || { echo "::error::$d is missing $f"; exit 1; }
+            done
+          done
+
+      - name: Shell script syntax
+        run: |
+          for f in setup.sh scripts/*.sh job_scripts/*.sh experiments/EXP*/run.sh; do
+            bash -n "$f" || exit 1
+          done

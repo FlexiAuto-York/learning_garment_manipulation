@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Large assets and generated data (see README §2.3 and §4)
+assets/
+assets.zip
+data/datasets/
+datasets/
+models/
+*.sif
+
+# Run output
+tmp/
+outputs/
+runs/
+results/
+wandb/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

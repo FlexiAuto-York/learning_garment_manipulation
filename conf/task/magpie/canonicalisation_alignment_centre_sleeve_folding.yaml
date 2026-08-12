@@ -1,0 +1,13 @@
+num_goals: 3
+garment_type: longsleeve
+asset_dir: assets
+task_name: canonicalisation_alignment_centre_sleeve_folding
+debug: false
+alignment: True
+goal_steps: 2
+through_canon: True
+iou_thresholds: [0.7, 0.7, 0.7]
+overstretch_penalty_scale: 0
+overstretch_penalty_threshold: 0
+affordance_penalty_scale: 0
+big_success_bonus: False

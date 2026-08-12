@@ -1,0 +1,56 @@
+from actoris_harena import Agent
+import random
+
+from .random_pick_and_fling import RandomPickAndFling
+from .dual_arm_random_pick_and_place import DualArmRandomPickAndPlace
+from .single_arm_random_pick_and_place import SingleArmRandomPickAndPlace
+from ..human.no_operation import NoOperation
+
+
+class RandomMultiPrimitive(Agent):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.primitive_names = [
+            "norm-pixel-pick-and-fling",
+            "norm-pixel-dual-pick-and-place",
+            "norm-pixel-single-pick-and-place",
+            "no-operation"
+        ]
+
+        self.primitive_instances = [
+            RandomPickAndFling(config),
+            DualArmRandomPickAndPlace(config),   # MUST be dual-picker compatible
+            SingleArmRandomPickAndPlace(config),
+            NoOperation(config)
+        ]
+
+        assert len(self.primitive_names) == len(self.primitive_instances)
+
+    def reset(self, arena_ids):
+        self.internal_states = {arena_id: {} for arena_id in arena_ids}
+
+    def init(self, infos):
+        pass
+
+    def update(self, infos, actions):
+        pass
+
+    def single_act(self, state, update=False):
+        """
+        Sample a primitive uniformly and delegate action generation.
+        """
+
+        pid = random.randrange(len(self.primitive_instances))
+        primitive_name = self.primitive_names[pid]
+        primitive = self.primitive_instances[pid]
+
+        action = primitive.single_act(state)
+
+        return {
+            primitive_name: action
+        }
+
+    def act(self, info_list, update=False):
+        return [self.single_act(info) for info in info_list]

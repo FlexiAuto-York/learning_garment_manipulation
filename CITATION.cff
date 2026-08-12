@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+title: >-
+  MAGPIE: Multi-Primitive Bimanual Garment Folding from Crumpled States
+  with Pixel-based Flow Matching Policies
+message: If you use this software, please cite it as below.
+type: software
+license: MIT
+version: 0.1.0
+repository-code: https://github.com/halid1020/learning_garment_manipulation
+abstract: >-
+  A data-driven system for bimanual garment manipulation covering flattening,
+  canonicalisation-alignment and folding from crumpled states. MAGPIE is a
+  multi-primitive imitation-learning policy in which an MLP classifier selects one
+  of four action primitives and per-primitive Optimal-Transport Conditional Flow
+  Matching networks generate the continuous parameters. LaGarNet is a
+  goal-conditioned latent-dynamics model used for model-predictive control.
+keywords:
+  - robotic manipulation
+  - deformable object manipulation
+  - garment folding
+  - imitation learning
+  - flow matching
+  - bimanual manipulation
+authors:
+  - family-names: Kadi
+    given-names: Halid Abdulrahim
+    affiliation: University of York
+  - family-names: Ajrou
+    given-names: Houdeyfa
+  - family-names: Walsh
+    given-names: Lucy
+  - family-names: Kapelyukh
+    given-names: Ivan
+    affiliation: Imperial College London
+  - family-names: Terzić
+    given-names: Kasim
+    affiliation: University of St Andrews
+  - family-names: Oyekan
+    given-names: John
+    affiliation: University of York
+
+# TODO: fill in once the paper is published.
+preferred-citation:
+  type: article
+  title: >-
+    Multi-Primitive Bimanual Garment Folding from Crumpled States
+    with Pixel-based Flow Matching Policies
+  authors:
+    - family-names: Kadi
+      given-names: Halid Abdulrahim
+    - family-names: Ajrou
+      given-names: Houdeyfa
+    - family-names: Walsh
+      given-names: Lucy
+    - family-names: Kapelyukh
+      given-names: Ivan
+    - family-names: Terzić
+      given-names: Kasim
+    - family-names: Oyekan
+      given-names: John
+  year: 2026
+  journal: "TODO: venue"
+  doi: "TODO: DOI"

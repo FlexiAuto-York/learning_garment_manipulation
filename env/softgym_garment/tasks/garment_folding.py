@@ -1,0 +1,595 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from statistics import median
+from statistics import mean
+
+from actoris_harena import save_video
+from actoris_harena.utilities.visual_utils import save_numpy_as_gif as sg
+
+from .utils import *
+from .folding_rewards import *
+from .garment_task import GarmentTask
+from ..utils.garment_utils import simple_rigid_align
+
+SUCCESS_TRESHOLD = 0.05
+# IOU_TRESHOLDS = [0.75, 0.75, 0.75]
+
+def save_point_cloud_ply(path, points):
+    N = points.shape[0]
+    header = f"""ply
+            format ascii 1.0
+            element vertex {N}
+            property float x
+            property float y
+            property float z
+            end_header
+            """
+    
+    with open(path, "w") as f:
+        f.write(header)
+        for p in points:
+            f.write(f"{p[0]} {p[1]} {p[2]}\n")
+
+
+def load_point_cloud_ply(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    # find end of header robustly
+    end_header_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip() == "end_header":
+            end_header_idx = idx + 1
+            break
+    if end_header_idx is None:
+        raise ValueError(f"No 'end_header' found in PLY file: {path}")
+
+    points = []
+    for line in lines[end_header_idx:]:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        x, y, z = map(float, parts[:3])
+        points.append([x, y, z])
+    return np.array(points)
+
+
+class GarmentFoldingTask(GarmentTask):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_goals = config.num_goals
+        self.name = config.task_name
+
+        self.config = config
+        self.demonstrator = config.demonstrator ## TODO: This needs to be initialised before the class.
+
+        # One threshold per subgoal: the initial flattened/canonical state plus each
+        # fold step, i.e. goal_steps + 1 subgoals in total.
+        self.iou_thresholds = config.get('iou_thresholds', [0.80] * (self.config.goal_steps + 1))
+        self.use_strict_alignment = config.get('alignment', False) is True
+        self.goals = [] # This needs to be loaded  or generated
+        self.has_succeeded = False
+        self.through_canon = config.get('through_canon', False)
+        
+        
+
+    def reset(self, arena):
+        """Reset environment and generate goals if necessary."""
+        # arena._save_debug_state("task_reset_start")
+        self.goal_dir = os.path.join(self.asset_dir, 'goals', arena.get_name(), \
+                                     self.name, arena.get_mode(), f"eid_{arena.get_episode_id()}")
+        
+        os.makedirs(self.goal_dir, exist_ok=True)
+
+        # Load or create semantic keypoints
+        self.semkey2pid = self._load_or_create_keypoints(arena)
+
+        # Generate goals (10 small variations)
+        self.goals = []
+        self.goals = self._load_or_generate_goals(arena, self.num_goals)
+
+        self.aligned_pairs = []
+        self.has_succeeded = False
+
+        if self.through_canon:
+            arena.flattened_obs = None
+            arena.get_caon_flattened_obs()
+        
+        # arena._save_debug_state("task_reset_complete")
+
+        return {"goals": self.goals, "keypoints": self.semkey2pid}
+
+    def _generate_a_goal(self, arena):
+        goal = []
+        particle_pos = arena.get_particle_positions()
+
+        if self.through_canon:
+            info = arena.set_to_canon_flatten()
+        elif self.config.get('randomise_goal', False):
+            info = arena.set_to_random_flatten()
+        else:
+            info = arena.set_to_flatten()
+
+        self.demonstrator.reset([arena.id])
+        goal.append(info)
+        while not self.demonstrator.terminate()[arena.id]: ## The demonstrator does not need update and init function
+            #print('here!')
+            action = self.demonstrator.single_act(info) # Fold action
+            #print('action', action)
+            info = arena.step(action)
+            goal.append(info)
+            if self.config.debug:
+                rgb = info['observation']['rgb']
+                cv2.imwrite("tmp/step_rgb.png", rgb)
+        
+        if self.config.debug:
+            frames = arena.get_frames()
+            if len(frames) > 0:
+                save_video(np.stack(arena.get_frames()), 'tmp', 'demo_videos')
+                sg(
+                    np.stack(arena.get_frames()), 
+                    path='tmp',
+                    filename="demo_videos"
+                )
+            
+        arena.set_particle_positions(particle_pos)
+        arena.action_step = 0
+
+        return goal
+
+
+    def _load_or_generate_goals(self, arena, num_goals):
+        goals = []
+        for i in range(num_goals):
+            goal_path = os.path.join(self.goal_dir, f"goal_{i}")
+            if not os.path.exists(goal_path):
+                print(f'[GarmentFoldingTask, _load_or_generate_goals] Generating goal {i} for episode id {arena.eid}')
+                goal = self._generate_a_goal(arena)
+
+                # Keep exactly the goal_steps + 1 subgoals the task uses (initial
+                # flattened/canonical state + each fold); drop the demonstrator's
+                # redundant terminal frame so that the number of images saved matches
+                # the number later loaded (range(goal_steps + 1)).
+                subgoals = goal[:-1]
+
+                os.makedirs(goal_path, exist_ok=True)
+
+                for j, subgoal in enumerate(subgoals):
+                    # Save RGB
+                    plt.imsave(os.path.join(goal_path, f"rgb_step_{j}.png"), subgoal['observation']['rgb']/255.0)
+
+                    # Save Depth as a numpy array
+                    if 'depth' in subgoal['observation']:
+                        np.save(os.path.join(goal_path, f"depth_step_{j}.npy"), subgoal['observation']['depth'])
+
+                    # Save particles as PLY
+                    save_point_cloud_ply(os.path.join(goal_path, f"particles_step_{j}.ply"),
+                                        subgoal['observation']["particle_positions"])
+
+                goals.append(subgoals)
+            else:
+                goal = []
+                for j in range(self.config.goal_steps + 1):
+                    # Load existing goal RGB
+                    rgb = (plt.imread(os.path.join(goal_path, f"rgb_step_{j}.png"))*255).astype(np.uint8)
+                    particles = load_point_cloud_ply(os.path.join(goal_path, f"particles_step_{j}.ply"))
+                    
+                    subgoal = {
+                        'observation': {
+                            'rgb': rgb[:, :, :3],
+                            'particle_positions': particles,
+                            'mask': rgb[:, :, :3].sum(axis=2) > 0
+                        }
+                    }
+
+                    # --- NEW: Load Depth from numpy array if it exists ---
+                    depth_file = os.path.join(goal_path, f"depth_step_{j}.npy")
+                    if os.path.exists(depth_file):
+                        subgoal['observation']['depth'] = np.load(depth_file)
+                    else:
+                        # Fallback for old cached goals that didn't have depth saved
+                        subgoal['observation']['depth'] = np.zeros_like(rgb[:, :, :1], dtype=np.float32)
+
+                    goal.append(subgoal.copy())
+                goals.append(goal.copy())
+        return goals
+
+    def evaluate(self, arena):
+        """Evaluate folding quality using particle alignment and semantic keypoints."""
+        # arena._save_debug_state(f"task_eval_step_{arena.action_step}")
+
+        if len(self.goals) == 0:
+            return {}
+        cur_particles = arena.get_mesh_particles_positions()
+
+        # Evaluate particle alignment against each goal
+        particle_distances = []
+        key_distances = []
+        for goal in self.goals:
+            goal_particles = goal[-1]['observation']["particle_positions"]
+            mdp, kdp = self._compute_particle_distance(cur_particles, goal_particles, arena)
+            particle_distances.append(mdp)
+            key_distances.append(kdp)
+       
+        mean_particle_distance = median(particle_distances)
+        key_particle_distance = median(key_distances)
+
+        # --- Active subgoal from the CURRENT state ------------------------------
+        # The active target is the subgoal following the furthest one the current
+        # mask already satisfies. If the current state matches no subgoal (e.g. a
+        # failed fold), it reverts to the first subgoal (the flattened / canonical
+        # state), signalling the user/agent to restart (re-flatten). This is computed
+        # purely from the present observation, so the interface never lags nor sticks
+        # on a target the garment no longer matches.
+        trj_infos = arena.get_trajectory_infos()
+        K = self.config.goal_steps + 1
+        current_info = trj_infos[-1]
+
+        # IoU of the current state against every subgoal, using the environment's own
+        # subgoal-matching function (the same one that drives success). Kept for the
+        # displayed overlay numbers below (active_subgoal_iou / algn_IoU).
+        subgoal_ious = [self._iou_for_goal_step(arena, current_info, g) for g in range(K)]
+
+        # Furthest subgoal reached as a CONTIGUOUS temporal sequence ending at the current
+        # step: the last (g+1) trajectory steps must match subgoals 0..g in order. This
+        # mirrors success()'s last-K window (see success(), the range(K) sub-goal check),
+        # so the overlay stays in lock-step with the success criterion. A per-frame max
+        # over subgoal IoUs (the previous approach) could not tell forward progress from a
+        # regression: a crumpled state mid re-flatten incidentally matches a later fold
+        # subgoal and made the overlay jump ahead to the final target. Requiring a clean
+        # flat->fold1(->fold2) suffix ending *now* fixes that, since a re-flattening
+        # garment has no such suffix and correctly falls back to the flattened subgoal.
+        N = len(trj_infos)
+        achieved = -1
+        for g in range(min(K, N)):
+            if all(
+                self._iou_for_goal_step(arena, trj_infos[N - 1 - g + j], j)
+                >= self.iou_thresholds[j]
+                for j in range(g + 1)
+            ):
+                achieved = g
+
+        # Hold the final subgoal whenever the current frame still matches it, mirroring
+        # success()'s latched branch (the `has_succeeded` check compares only the current
+        # mask to the final goal). With stop_on_success=False the episode continues past a
+        # first success, and a corrective step can break the clean flat->fold1->fold2
+        # suffix above while the fold itself is still held; without this guard the overlay
+        # would tell the user to re-flatten a garment the environment already counts as a
+        # completed fold. This uses the current frame only, so (unlike gating on the
+        # lagging `has_succeeded`) it also fires on the very step success first triggers,
+        # and it does not re-open the re-flatten bug: a spread/crumpled garment does not
+        # match the compact final fold, so the guard stays inactive during re-flattening.
+        if subgoal_ious[K - 1] >= self.iou_thresholds[K - 1]:
+            achieved = K - 1
+        active_idx = min(achieved + 1, K - 1)
+
+        # IoU of the current state against the active target subgoal, exposed so the
+        # human interface can display the exact value the environment uses to judge
+        # subgoal success (keeping the overlay consistent with the metrics).
+        active_subgoal_iou = subgoal_ious[active_idx]
+        # ------------------------------------------------------------------------
+
+        return {
+            "mean_particle_distance": mean_particle_distance,
+            "semantic_keypoint_distance": key_particle_distance,
+            'max_IoU': self._get_max_IoU(arena),
+            # Strict IoU to the final fold subgoal, computed exactly as the success
+            # criterion and the interface overlay do (max over all goal variations,
+            # observation mask), so 'Align IoU(fold)' stays consistent with Success
+            # and the displayed subgoal IoU.
+            'algn_IoU': subgoal_ious[K - 1],
+            'max_IoU_to_flattened':  self._get_max_IoU_to_flattened(arena),
+            'algn_IoU_to_flattened': self._get_algn_IoU_to_flattened(arena),
+            'normalised_coverage': self._get_normalised_coverage(arena),
+            'active_subgoal_idx': active_idx,
+            'active_subgoal_iou': active_subgoal_iou,
+            'iou_thresholds': self.iou_thresholds
+        }
+
+    def _align_points(self, arena, cur, goal):
+        """
+        Align cur points to goal points using Procrustes rigid alignment.
+        Returns aligned points and mean distance.
+        """
+        
+        if self.use_strict_alignment:
+            return cur, goal
+
+        if self.config.alignment == 'simple_rigid':
+            # Center both sets
+            aligned_curr, aligned_goal = simple_rigid_align(cur, goal)
+        else:
+            raise NotImplementedError
+        
+        # Safety check for NaNs
+        assert not (np.isnan(aligned_curr).any() or np.isnan(aligned_goal).any()), \
+            "NaN values detected after point alignment!"
+        
+        return aligned_curr, aligned_goal
+    
+    def _get_algn_IoU_to_flattened(self, arena):
+        # Strict IoU to the flattened / canonical subgoal (subgoal 0), taken as the best
+        # match over all goal variations (the 3 demo saved goals). This mirrors
+        # _iou_for_goal_step(..., 0) so the reported 'Align IoU(flat)' stays consistent
+        # with the interface overlay shown while the garment is being flattened.
+        cur_mask = arena.cloth_mask
+        algn_IoU = 0.0
+        for goal in self.goals:
+            goal_mask = goal[0]['observation']['rgb'].sum(axis=2) > 0
+            IoU = calculate_iou(cur_mask, goal_mask)
+            algn_IoU = max(algn_IoU, IoU)
+        return algn_IoU
+    
+    def _compute_particle_distance(self, cur, goal, arena):
+        """Align particles and compute mean distance."""
+        #print('len cur', len(cur))
+        aligned_curr, aligned_goal = self._align_points(arena, cur.copy(), goal.copy())
+        mdp = np.mean(np.linalg.norm(aligned_curr - aligned_goal, axis=1))
+
+        cur_pts = []
+        goal_pts = []
+        for name, pid in self.semkey2pid.items():
+            
+            cur_pts.append(aligned_curr[pid])
+            goal_pts.append(aligned_goal[pid])
+        cur_pts = np.stack(cur_pts)
+        goal_pts = np.stack(goal_pts)
+        kdp = np.mean(np.linalg.norm(cur_pts - goal_pts, axis=1))
+        
+
+        if self.config.debug:
+            save_point_cloud_ply(os.path.join('tmp', f"cur_particles_step_{arena.action_step}.ply"), cur)
+            save_point_cloud_ply(os.path.join('tmp', "goal_particles.ply"), goal)
+            for align_type in ['simple_rigid']:
+                if align_type == 'simple_rigid':
+                    aligned_curr, aligned_goal = simple_rigid_align(cur, goal)
+                mdp_ = np.mean(np.linalg.norm(aligned_curr - aligned_goal, axis=1))
+                project_aligned, _ = arena.get_visibility(aligned_curr)
+                project_goal, _ = arena.get_visibility(aligned_goal)
+                canvas = np.zeros((480, 480, 3), dtype=np.uint8)
+
+                for p in project_aligned:
+                    x, y = map(int, p)
+                    if x > 480 or y> 480:
+                        continue
+                    canvas[x, y] = (255, 255, 255)
+
+                for p in project_goal:
+                    x, y = map(int, p)
+                    if x > 480 or y> 480:
+                        continue
+                    canvas[x, y] = (0, 255, 0)
+
+                # Save both images
+                combined = np.hstack((canvas, arena._render('rgb')))
+
+                # 🔹 Overlay mdp value on combined image
+                cv2.putText(
+                    combined,
+                    f"MDP: {mdp_:.4f}",
+                    (10, 30),  # position (x, y)
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,       # font scale
+                    (0, 0, 255),  # color (red)
+                    2,         # thickness
+                    cv2.LINE_AA
+                )
+                cv2.imwrite(f"tmp/{align_type}_combined_{arena.action_step}.png", combined)
+
+        return mdp, kdp
+
+    
+    def reward(self, last_info, action, info): 
+        mpd = info['evaluation']['mean_particle_distance']
+        mkd = info['evaluation']["semantic_keypoint_distance"]
+        
+        pdr = particle_distance_reward(mpd)
+        pdr_ = pdr
+
+        
+        #Multi stage reward
+        if last_info == None:
+            last_info = info
+        last_particles = last_info['observation']['particle_positions']
+        cur_particles = info['observation']['particle_positions']
+        
+        if info['success']:
+            if self.config.get('big_success_bonus', True):
+                multi_stage_reward += self.config.goal_steps*(info['arena'].action_horizon - info['observation']['action_step'])
+                pdr_ += (info['arena'].action_horizon - info['observation']['action_step'])
+            else:
+                multi_stage_reward = self.config.goal_steps
+        else:
+
+            arena = info['arena']
+            trj_infos = arena.get_trajectory_infos()
+            N = len(trj_infos)
+            K = self.config.goal_steps + 1
+
+            # Always give some shaping based on current IoU to goal[0]
+            multi_stage_reward = self._iou_for_goal_step(arena, trj_infos[-1], 0)
+
+            K = min(K, N)
+            # Need at least K trajectory steps to attempt full alignment
+            
+            traj_window = trj_infos[N - K : N]
+
+            best_reward = multi_stage_reward
+
+            # Try all possible start positions for goal[0]
+            for start in range(K):
+                matched_steps = 0
+                last_iou = 0.0
+
+                for g in range(K):
+                    t = start + g
+                    if t >= K:
+                        break
+
+                    iou = self._iou_for_goal_step(
+                        arena,
+                        traj_window[t],
+                        g
+                    )
+
+                    #print(f"[reward] K={K} start={start}, step={t}, goal={g}, iou={iou:.3f}")
+
+                    if iou >= self.iou_thresholds[g]:
+                        matched_steps += 1
+                        last_iou = 0.0
+                    else:
+                        last_iou = iou
+                        break
+
+                    if t == K - 1:
+                        reward = matched_steps + last_iou
+                        best_reward = max(best_reward, reward)
+                
+            if self.config.get('base_reward', None) == 'aug-converage-alignment' and multi_stage_reward <= 1.0:
+                multi_stage_reward = coverage_alignment_reward(last_info, action, info) # combination of delta NC and delta IOU
+                if info['evaluation']['normalised_coverage'] > NC_FLATTENING_TRESHOLD and info['evaluation']['max_IoU_to_flattened'] > IOU_FLATTENING_TRESHOLD:
+                    multi_stage_reward = 1
+
+            multi_stage_reward = best_reward
+
+        multi_stage_reward /= self.config.goal_steps # make sure it is between 0 and 1
+
+        threshold =  self.config.get('overstretch_penalty_threshold', 0)
+        if info['overstretch'] > threshold:
+            pdr_ -= self.config.get("overstretch_penalty_scale", 0) * (info['overstretch'] - threshold)
+            multi_stage_reward -= self.config.get("overstretch_penality_scale", 0) * (info['overstretch'] - threshold)
+        
+        aff_score_pen = (1 - info.get('action_affordance_score', 1))
+        multi_stage_reward -= self.config.get("affordance_penalty_scale", 0) * aff_score_pen
+
+        return {
+            'particle_distance': pdr,
+            'particle_distance_with_stretch_penality': pdr_,
+            'keypoint_distance': particle_distance_reward(mkd),
+            'multi_stage_reward': multi_stage_reward,
+        }
+    
+    def _iou_for_goal_step(self, arena, traj_info, goal_step):
+        """
+        Compute IoU between current trajectory step mask
+        and all goal masks at a specific goal_step based on strict alignment flag.
+        """
+        cur_mask = traj_info['observation']['mask']
+        best_IoU = 0.0
+
+        for goal in self.goals:
+            goal_mask = goal[goal_step]['observation']['rgb'].sum(axis=2) > 0
+            
+            if self.use_strict_alignment:
+                IoU = calculate_iou(cur_mask, goal_mask)
+            else:
+                IoU, _ = get_max_IoU(cur_mask, goal_mask, debug=self.config.debug)
+                
+            best_IoU = max(best_IoU, IoU)
+
+        return best_IoU
+
+    def get_goals(self):
+        return self.goals
+
+    def get_goal(self):
+        return self.goals[0]
+    
+    def success(self, arena):
+        trj_infos = arena.get_trajectory_infos()
+        N = len(trj_infos)
+        K = self.config.goal_steps + 1
+        
+        if len(trj_infos) < K:
+            return False
+        
+        if self.has_succeeded:
+            mask = trj_infos[-1]['observation']['mask']
+            best_IoU = 0
+            for goal in self.goals:
+                goal_mask = goal[-1]['observation']["rgb"].sum(axis=2) > 0
+                
+                # --- NEW: Strict checking ---
+                if self.use_strict_alignment:
+                    IoU = calculate_iou(mask, goal_mask)
+                else:
+                    IoU, _ = get_max_IoU(mask, goal_mask, debug=self.config.debug)
+                    
+                best_IoU = max(IoU, best_IoU)
+                
+            if best_IoU < self.iou_thresholds[-1]:
+                self.has_succeeded = False
+                print('[folding task] Success is messed up!')
+                return False
+            else:
+                print('[folding task] Successful Step!')
+                return True
+        
+        # if has not succeeded before, check consequent sub goals
+        for k in range(K):
+            mask  = trj_infos[N - K + k]['observation']['mask']
+            best_IoU = 0
+            for goal in self.goals:
+                goal_mask = goal[k]['observation']["rgb"].sum(axis=2) > 0
+                
+                # --- NEW: Strict checking ---
+                if self.use_strict_alignment:
+                    IoU = calculate_iou(mask, goal_mask)
+                else:
+                    IoU, _ = get_max_IoU(mask, goal_mask, debug=self.config.debug)
+                    
+                best_IoU = max(IoU, best_IoU)
+                
+            if best_IoU < self.iou_thresholds[k]:
+                return False
+                
+        print('[folding task] Successful Step!')
+        self.has_succeeded = True
+        return True
+        
+
+    def _get_max_IoU(self, arena):
+        cur_mask = arena.cloth_mask
+        max_IoU = 0
+        # Take the best match over all goal variations, consistent with how success
+        # and the subgoal IoU are computed.
+        for goal in self.goals:
+            goal_mask = goal[-1]['observation']["rgb"].sum(axis=2) > 0 ## only useful for background is black
+
+            IoU, matched_IoU = get_max_IoU(cur_mask, goal_mask, debug=self.config.debug)
+            if IoU > max_IoU:
+                max_IoU = IoU
+
+        return max_IoU
+    
+    def _get_algn_IoU(self, arena):
+        cur_mask = arena.cloth_mask
+        algn_IoU = 0
+        for goal in self.goals[:1]:
+            goal_mask = goal[-1]['observation']["rgb"].sum(axis=2) > 0 ## only useful for background is black
+            
+            IoU = calculate_iou(cur_mask, goal_mask)
+            if IoU > algn_IoU:
+                algn_IoU = IoU
+        
+        return algn_IoU
+    
+    def _get_max_IoU_to_flattened(self, arena):
+        # Best-alignment IoU to the flattened / canonical subgoal (subgoal 0), taken as
+        # the best match over all goal variations (the 3 demo saved goals), consistent
+        # with the rest of the reported metrics and the interface overlay.
+        cur_mask = arena.cloth_mask
+        max_IoU = 0.0
+        for goal in self.goals:
+            goal_mask = goal[0]['observation']['rgb'].sum(axis=2) > 0
+            IoU, _ = get_max_IoU(cur_mask, goal_mask, debug=self.config.debug)
+            max_IoU = max(max_IoU, IoU)
+        return max_IoU
+    
+    def _get_normalised_coverage(self, arena):
+        res = arena._get_coverage() / arena.flatten_coverage
+        
+        # clip between 0 and 1
+        return np.clip(res, 0, 1)

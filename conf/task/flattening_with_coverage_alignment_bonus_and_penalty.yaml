@@ -1,0 +1,18 @@
+num_goals: 1
+garment_type: longsleeve
+asset_dir: assets
+task_name: flattening
+debug: false
+alignment: simple_rigid
+overstretch_penalty_scale: 0
+overstretch_penalty_threshold: 0.0
+affordance_penalty_scale: 0
+big_success_bonus: False
+
+reward_config:
+  alpha: 0.5
+  NC_success_threshold: 0.95
+  IoU_success_threshold: 0.90
+  apply_success_bonus: False
+  apply_mess_up_penalty: False
+  apply_large_action_penalty_when_success: False

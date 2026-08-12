@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learning_garment_manipulation"
+version = "0.1.0"
+description = "Learning bimanual garment manipulation: MAGPIE multi-primitive flow-matching policies and LaGarNet latent-dynamics MPC"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Halid A. Kadi" },
+    { name = "Houdeyfa Ajrou" },
+    { name = "Lucy Walsh" },
+    { name = "Ivan Kapelyukh" }
+]
+
+# --- BASE DEPENDENCIES ---
+# These are installed by default when someone runs `pip install -e .`
+# Note: `actoris_harena` and `softgym` are installed separately from their own
+# repositories -- see README section 2.
+dependencies = [
+    "pycurl",
+    "segment_anything==1.0",
+    "torch", # Base torch (can be <2.0.0 for standard agents)
+    "torch_geometric",
+    "torch-scatter",
+    "torch-sparse",
+    "hydra-core>=1.3",   # every entry point in tool/ is a Hydra app
+    "omegaconf",
+    "opencv-python",
+    "dotmap",
+    "tqdm",
+]
+
+# --- OPTIONAL DEPENDENCIES (EXTRAS) ---
+# Installed via commands like `pip install -e ".[clothmate]"`
+[project.optional-dependencies]
+
+# Extra: ClothMate Agent
+clothmate = [
+    "trimesh",
+    "OpenEXR"
+]
+
+# Extra: Advanced / Torch 2.0+ Agents
+# MAGPIE, LaGarNet (GC_RSSM/RSSM) and multi-primitive diffusion are only registered when
+# torch >= 2.0.0 -- see the version check in registration/agent.py. Install this extra to
+# run the network-based policies.
+advanced = [
+    "torch>=2.0.0"
+]
+
+# Extra: Development
+dev = [
+    "pytest",
+    "ruff"
+]
+
+# Extra: Install everything at once
+all = [
+    "trimesh",
+    "OpenEXR",
+    "torch>=2.0.0",
+    "pytest",
+    "ruff"
+]
+
+[tool.setuptools]
+packages = [
+    "controllers",
+    "env",
+    "tool",
+    "registration",
+    "real_robot",
+    "perception",
+    "data_augmentation",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+filterwarnings = ["ignore::UserWarning"]
